@@ -37,8 +37,13 @@ struct ControlsSidebar: View {
         VStack(spacing: 0) {
             // Header with connection status
             VStack(spacing: 8) {
+                Text("HOTWIRE")
+                    .font(.system(size: 18, weight: .black, design: .default))
+                    .tracking(2)
+                
                 Text("Canon 6D Mark II")
-                    .font(.headline)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 
                 HStack(spacing: 6) {
                     Circle()
@@ -47,6 +52,20 @@ struct ControlsSidebar: View {
                     Text(controller.connectionStatus)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    // Daemon Killer indicator
+                    if controller.daemonKillerActive {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bolt.fill")
+                                .font(.caption2)
+                            Text("DK")
+                                .font(.caption2.bold())
+                        }
+                        .foregroundColor(.orange)
+                        .help("Daemon Killer Active - USB is protected")
+                    }
                 }
                 
                 if !controller.isConnected {

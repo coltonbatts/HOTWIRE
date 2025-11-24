@@ -8,6 +8,7 @@ class CameraController: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var connectionStatus: String = "Disconnected"
     @Published var statusMessage: String = "Ready"
+    @Published var daemonKillerActive: Bool = false
 
     // Live View
     @Published var isLiveViewActive: Bool = false
@@ -35,25 +36,95 @@ class CameraController: ObservableObject {
     @Published var availableShutterSpeeds: [String] = ["30", "25", "20", "15", "13", "10", "8", "6", "5", "4", "3.2", "2.5", "2", "1.6", "1.3", "1", "0.8", "0.6", "0.5", "0.4", "0.3", "1/4", "1/5", "1/6", "1/8", "1/10", "1/13", "1/15", "1/20", "1/25", "1/30", "1/40", "1/50", "1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500", "1/640", "1/800", "1/1000", "1/1250", "1/1600", "1/2000", "1/2500", "1/3200", "1/4000", "1/5000", "1/6400", "1/8000"]
 
     private var liveViewTimer: Timer?
+    private var daemonKillerTimer: Timer?
     private let gphoto2Path = "/opt/homebrew/bin/gphoto2"
     private var isFetchingFrame: Bool = false
     private var liveViewRetryCount: Int = 0
-    private let maxLiveViewRetries: Int = 3
+    private let maxLiveViewRetries: Int = 5
 
     // MARK: - Initialization
     
     init() {
         // Default capture folder on Desktop
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
-        self.captureFolder = desktop.appendingPathComponent("Canon Tethered Captures")
+        self.captureFolder = desktop.appendingPathComponent("Hotwire Captures")
     }
 
     func initialize() {
-        statusMessage = "Initializing..."
+        statusMessage = "Initializing HOTWIRE..."
+        
+        // Start the Daemon Killer first - this is critical
+        startDaemonKiller()
+        
         setupCaptureFolder()
         checkGphoto2Installation()
-        scanForCamera()
-        loadExistingCaptures()
+        
+        // Give daemon killer a moment to clear the USB
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await scanForCamera()
+            loadExistingCaptures()
+        }
+    }
+    
+    // MARK: - Daemon Killer (Phase 1 Critical Feature)
+    
+    /// Starts a background process that continuously kills macOS camera daemons
+    /// This prevents PTPCamera and ptpcamerad from stealing the USB connection
+    private func startDaemonKiller() {
+        daemonKillerActive = true
+        statusMessage = "🔪 Daemon Killer active"
+        
+        // Kill immediately on startup
+        Task {
+            await killAllCameraDaemons()
+        }
+        
+        // Then keep killing every 2 seconds
+        daemonKillerTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.killAllCameraDaemons()
+            }
+        }
+    }
+    
+    func stopDaemonKiller() {
+        daemonKillerTimer?.invalidate()
+        daemonKillerTimer = nil
+        daemonKillerActive = false
+    }
+    
+    /// Kills all known macOS daemons that interfere with USB camera access
+    private func killAllCameraDaemons() async {
+        // These are the culprits that steal USB camera connections on macOS:
+        // 1. ptpcamerad - The main PTP camera daemon (most aggressive)
+        // 2. PTPCamera - Legacy daemon
+        // 3. photolibraryd - Can sometimes grab the device
+        
+        let daemons = ["ptpcamerad", "PTPCamera"]
+        
+        for daemon in daemons {
+            _ = await runCommandQuiet("/usr/bin/killall", arguments: ["-9", daemon])
+        }
+    }
+    
+    /// Run a command without updating status (for background daemon killing)
+    private func runCommandQuiet(_ command: String, arguments: [String]) async -> Bool {
+        return await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: command)
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                continuation.resume(returning: process.terminationStatus == 0)
+            } catch {
+                continuation.resume(returning: false)
+            }
+        }
     }
     
     private func setupCaptureFolder() {
@@ -156,8 +227,9 @@ class CameraController: ObservableObject {
         statusMessage = "Scanning for camera..."
 
         Task {
-            // First, kill camera daemons
-            await killPTPCamera()
+            // Daemon killer should already be running, but ensure daemons are dead
+            await killAllCameraDaemons()
+            try? await Task.sleep(nanoseconds: 300_000_000)
 
             // Detect camera
             let result = await runCommand(gphoto2Path, arguments: ["--auto-detect"])
@@ -165,7 +237,7 @@ class CameraController: ObservableObject {
             if result.success && result.output.contains("Canon") {
                 isConnected = true
                 connectionStatus = "Connected"
-                statusMessage = "Canon 6D Mark II detected"
+                statusMessage = "✓ Canon 6D Mark II connected"
 
                 // Get current camera settings
                 await fetchCurrentSettings()
@@ -178,7 +250,7 @@ class CameraController: ObservableObject {
     }
     
     private func fetchCurrentSettings() async {
-        await ensureDeviceAccess()
+        await killAllCameraDaemons()
         
         // Get current ISO
         let isoResult = await runCommand(gphoto2Path, arguments: ["--get-config", "iso"])
@@ -211,21 +283,6 @@ class CameraController: ObservableObject {
         return nil
     }
 
-    private func killPTPCamera() async {
-        // Kill both ptpcamerad and PTPCamera - both can claim the USB device
-        _ = await runCommand("/usr/bin/killall", arguments: ["-9", "ptpcamerad"])
-        _ = await runCommand("/usr/bin/killall", arguments: ["-9", "PTPCamera"])
-        try? await Task.sleep(nanoseconds: 300_000_000) // Wait 300ms
-    }
-    
-    /// Kill camera daemons before any camera operation
-    private func ensureDeviceAccess() async {
-        // Must kill ptpcamerad - this is the main culprit on modern macOS
-        _ = await runCommand("/usr/bin/killall", arguments: ["-9", "ptpcamerad"])
-        _ = await runCommand("/usr/bin/killall", arguments: ["-9", "PTPCamera"])
-        try? await Task.sleep(nanoseconds: 300_000_000) // Wait 300ms
-    }
-
     private func getCameraSummary() async {
         let result = await runCommand(gphoto2Path, arguments: ["--summary"])
         if result.success {
@@ -248,8 +305,9 @@ class CameraController: ObservableObject {
         isLiveViewActive = true
         liveViewRetryCount = 0
 
-        // Start timer to fetch live view frames (every 0.8s for stability)
-        liveViewTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
+        // Start timer to fetch live view frames
+        // With daemon killer running, we can try faster frame rate
+        liveViewTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.fetchLiveViewFrame()
             }
@@ -276,32 +334,36 @@ class CameraController: ObservableObject {
 
         isFetchingFrame = true
         
-        // Kill camera daemons before accessing camera
-        await ensureDeviceAccess()
+        // Daemon killer is running in background, no need to kill here every time
 
-        let previewPath = "/tmp/canon_preview_\(UUID().uuidString).jpg"
+        let previewPath = "/tmp/hotwire_preview.jpg"
 
         let result = await runCommand(gphoto2Path, arguments: [
             "--capture-preview",
-            "--filename=\(previewPath)"
+            "--filename=\(previewPath)",
+            "--force-overwrite"
         ])
 
         if result.success {
             if let image = NSImage(contentsOfFile: previewPath) {
                 liveViewImage = image
-                statusMessage = "Live view active"
+                if liveViewRetryCount > 0 {
+                    statusMessage = "Live view restored"
+                } else {
+                    statusMessage = "🔴 Live"
+                }
                 liveViewRetryCount = 0 // Reset retry count on success
             }
-            // Clean up temp file
-            try? FileManager.default.removeItem(atPath: previewPath)
         } else {
             liveViewRetryCount += 1
             
             if liveViewRetryCount >= maxLiveViewRetries {
                 stopLiveView()
-                statusMessage = "Live view failed after \(maxLiveViewRetries) attempts. Try again."
+                statusMessage = "Live view failed. Reconnecting may help."
             } else {
-                statusMessage = "Live view retry \(liveViewRetryCount)/\(maxLiveViewRetries)..."
+                statusMessage = "Live view reconnecting (\(liveViewRetryCount)/\(maxLiveViewRetries))..."
+                // On failure, give the daemon killer a chance to clear things
+                try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
 
@@ -318,7 +380,7 @@ class CameraController: ObservableObject {
 
         Task {
             // Kill camera daemons before accessing camera
-            await ensureDeviceAccess()
+            await killAllCameraDaemons()
             
             // Create filename with timestamp
             let dateFormatter = DateFormatter()
@@ -382,7 +444,7 @@ class CameraController: ObservableObject {
 
     func updateISO() {
         Task {
-            await ensureDeviceAccess()
+            await killAllCameraDaemons()
             let result = await runCommand(gphoto2Path, arguments: [
                 "--set-config",
                 "iso=\(selectedISO)"
@@ -398,7 +460,7 @@ class CameraController: ObservableObject {
 
     func updateAperture() {
         Task {
-            await ensureDeviceAccess()
+            await killAllCameraDaemons()
             // Remove "f/" prefix for gphoto2
             let apertureValue = selectedAperture.replacingOccurrences(of: "f/", with: "")
             let result = await runCommand(gphoto2Path, arguments: [
@@ -416,7 +478,7 @@ class CameraController: ObservableObject {
 
     func updateShutterSpeed() {
         Task {
-            await ensureDeviceAccess()
+            await killAllCameraDaemons()
             let result = await runCommand(gphoto2Path, arguments: [
                 "--set-config",
                 "shutterspeed=\(selectedShutter)"
