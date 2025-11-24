@@ -37,10 +37,12 @@ class CameraController: ObservableObject {
 
     private var liveViewTimer: Timer?
     private var daemonKillerTimer: Timer?
+    private var connectionMonitorTimer: Timer?
     private let gphoto2Path = "/opt/homebrew/bin/gphoto2"
     private var isFetchingFrame: Bool = false
     private var liveViewRetryCount: Int = 0
     private let maxLiveViewRetries: Int = 5
+    private var isCheckingConnection: Bool = false
 
     // MARK: - Initialization
     
@@ -56,6 +58,9 @@ class CameraController: ObservableObject {
         // Start the Daemon Killer first - this is critical
         startDaemonKiller()
         
+        // Start connection monitor
+        startConnectionMonitor()
+        
         setupCaptureFolder()
         checkGphoto2Installation()
         
@@ -64,6 +69,81 @@ class CameraController: ObservableObject {
             try? await Task.sleep(nanoseconds: 500_000_000)
             await scanForCamera()
             loadExistingCaptures()
+        }
+    }
+    
+    // MARK: - Connection Monitor
+    
+    /// Monitors camera connection and updates status when unplugged
+    private func startConnectionMonitor() {
+        // Check connection every 3 seconds
+        connectionMonitorTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.checkConnectionStatus()
+            }
+        }
+    }
+    
+    private func stopConnectionMonitor() {
+        connectionMonitorTimer?.invalidate()
+        connectionMonitorTimer = nil
+    }
+    
+    /// Quick check if camera is still connected
+    private func checkConnectionStatus() async {
+        // Don't check if we're already checking or doing other operations
+        guard !isCheckingConnection, !isCapturing, !isFetchingFrame else { return }
+        
+        isCheckingConnection = true
+        
+        let output = await getCommandOutput(gphoto2Path, arguments: ["--auto-detect"])
+        let nowConnected = output.contains("Canon")
+        
+        let wasConnected = isConnected
+        
+        if wasConnected && !nowConnected {
+            // Camera was disconnected
+            isConnected = false
+            connectionStatus = "Disconnected"
+            statusMessage = "⚠️ Camera disconnected"
+            
+            // Stop live view if it was running
+            if isLiveViewActive {
+                stopLiveView()
+            }
+        } else if !wasConnected && nowConnected {
+            // Camera was reconnected
+            isConnected = true
+            connectionStatus = "Connected"
+            statusMessage = "✓ Camera reconnected"
+            
+            // Fetch settings
+            await fetchCurrentSettings()
+        }
+        
+        isCheckingConnection = false
+    }
+    
+    /// Get command output as string
+    private func getCommandOutput(_ command: String, arguments: [String]) async -> String {
+        return await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: command)
+            process.arguments = arguments
+            
+            let outputPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = FileHandle.nullDevice
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                continuation.resume(returning: output)
+            } catch {
+                continuation.resume(returning: "")
+            }
         }
     }
     
@@ -334,17 +414,19 @@ class CameraController: ObservableObject {
 
         isFetchingFrame = true
         
-        // Daemon killer is running in background, no need to kill here every time
+        // Use unique filename to avoid overwrite prompts
+        let previewPath = "/tmp/hotwire_lv_\(Int(Date().timeIntervalSince1970 * 1000)).jpg"
 
-        let previewPath = "/tmp/hotwire_preview.jpg"
+        // Use atomic kill-and-capture: kill daemons then immediately run gphoto2
+        // The 'yes |' auto-answers any prompts, preventing hangs
+        let result = await runShellCommand("""
+            killall -9 ptpcamerad PTPCamera 2>/dev/null; \
+            killall -9 ptpcamerad PTPCamera 2>/dev/null; \
+            killall -9 ptpcamerad PTPCamera 2>/dev/null; \
+            yes | \(gphoto2Path) --capture-preview --filename="\(previewPath)" 2>&1
+            """)
 
-        let result = await runCommand(gphoto2Path, arguments: [
-            "--capture-preview",
-            "--filename=\(previewPath)",
-            "--force-overwrite"
-        ])
-
-        if result.success {
+        if result.success || result.output.contains("Saving file") {
             if let image = NSImage(contentsOfFile: previewPath) {
                 liveViewImage = image
                 if liveViewRetryCount > 0 {
@@ -352,22 +434,55 @@ class CameraController: ObservableObject {
                 } else {
                     statusMessage = "🔴 Live"
                 }
-                liveViewRetryCount = 0 // Reset retry count on success
+                liveViewRetryCount = 0
             }
+            // Clean up temp file
+            try? FileManager.default.removeItem(atPath: previewPath)
         } else {
             liveViewRetryCount += 1
             
             if liveViewRetryCount >= maxLiveViewRetries {
                 stopLiveView()
-                statusMessage = "Live view failed. Reconnecting may help."
+                statusMessage = "Live view failed. Try unplugging and reconnecting camera."
             } else {
-                statusMessage = "Live view reconnecting (\(liveViewRetryCount)/\(maxLiveViewRetries))..."
-                // On failure, give the daemon killer a chance to clear things
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                statusMessage = "Live view connecting (\(liveViewRetryCount)/\(maxLiveViewRetries))..."
             }
         }
 
         isFetchingFrame = false
+    }
+    
+    /// Run a shell command (for atomic kill-and-execute operations)
+    private func runShellCommand(_ command: String) async -> (success: Bool, output: String, error: String) {
+        return await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-c", command]
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+
+                let output = String(data: outputData, encoding: .utf8) ?? ""
+                let error = String(data: errorData, encoding: .utf8) ?? ""
+
+                // Check for successful capture (file saved message or no error)
+                let success = process.terminationStatus == 0 || output.contains("Saving file")
+
+                continuation.resume(returning: (success, output, error))
+            } catch {
+                continuation.resume(returning: (false, "", error.localizedDescription))
+            }
+        }
     }
 
     // MARK: - Image Capture

@@ -55,6 +55,17 @@ struct ControlsSidebar: View {
                     
                     Spacer()
                     
+                    // Refresh connection button
+                    Button(action: {
+                        controller.scanForCamera()
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                    .help("Refresh camera connection")
+                    
                     // Daemon Killer indicator
                     if controller.daemonKillerActive {
                         HStack(spacing: 4) {
