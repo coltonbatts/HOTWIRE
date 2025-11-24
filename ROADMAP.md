@@ -3,12 +3,13 @@
 > **Concept:** A "Guitar Pedal for Cameras."
 > HOTWIRE is a live texture engine that sits between the lens and the file. It allows photographers to apply "heavy, gothy, vibe" effects (dithering, threshold, overlays) to the live view stream and capture baked-in JPEGs in real-time.
 
-## Phase 1: The Chassis (Core Stability)
+## Phase 1: The Chassis (Core Stability) ✅
 *Focus: Rock-solid connection and basic functionality.*
 - [x] **USB Connection:** Establish communication via `gphoto2`.
 - [x] **Live View:** Get the raw stream displaying in the window.
-- [ ] **Daemon Killer:** Automate the killing of `PTPCamera` on launch so the user never sees a connection error.
+- [x] **Daemon Killer:** Automate the killing of `PTPCamera` on launch so the user never sees a connection error.
 - [x] **Manual Controls:** Ensure ISO, Aperture, and Shutter Speed toggles are responsive and accurate.
+- [x] **Health Indicator:** Show gphoto2, camera, daemon, and storage status on startup.
 
 ## Phase 2: The Stompbox (Basic Effects)
 *Focus: The first set of "Pedals" in the signal chain.*

@@ -2,18 +2,17 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var cameraController = CameraController()
-    @State private var showingLiveView = false
 
     var body: some View {
         HSplitView {
             // Left Sidebar - Controls
-            ControlsSidebar(controller: cameraController, showingLiveView: $showingLiveView)
+            ControlsSidebar(controller: cameraController)
                 .frame(minWidth: 220, idealWidth: 250, maxWidth: 300)
             
             // Main Content Area
             VStack(spacing: 0) {
                 // Main Preview Area
-                MainPreviewArea(controller: cameraController, showingLiveView: $showingLiveView)
+                MainPreviewArea(controller: cameraController)
                 
                 // Bottom Filmstrip
                 FilmstripView(controller: cameraController)
@@ -31,7 +30,6 @@ struct ContentView: View {
 
 struct ControlsSidebar: View {
     @ObservedObject var controller: CameraController
-    @Binding var showingLiveView: Bool
     
     var body: some View {
         VStack(spacing: 0) {
@@ -86,6 +84,9 @@ struct ControlsSidebar: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
+                
+                // Health Status Indicator
+                HealthStatusView(controller: controller)
             }
             .padding()
             .frame(maxWidth: .infinity)
@@ -121,7 +122,6 @@ struct ControlsSidebar: View {
                             // Live View Toggle
                             Button(action: {
                                 controller.toggleLiveView()
-                                showingLiveView = controller.isLiveViewActive
                             }) {
                                 HStack {
                                     Image(systemName: controller.isLiveViewActive ? "video.slash.fill" : "video.fill")
@@ -241,7 +241,6 @@ struct ControlsSidebar: View {
 
 struct MainPreviewArea: View {
     @ObservedObject var controller: CameraController
-    @Binding var showingLiveView: Bool
     
     var body: some View {
         GeometryReader { geometry in
@@ -249,7 +248,7 @@ struct MainPreviewArea: View {
                 // Background
                 Color(NSColor.windowBackgroundColor)
                 
-                if showingLiveView && controller.isLiveViewActive {
+                if controller.isLiveViewActive {
                     // Live View
                     if let liveImage = controller.liveViewImage {
                         Image(nsImage: liveImage)
@@ -434,6 +433,152 @@ struct FilmstripThumbnail: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         return formatter.string(from: date)
+    }
+}
+
+// MARK: - Health Status View
+
+struct HealthStatusView: View {
+    @ObservedObject var controller: CameraController
+    @State private var isExpanded: Bool = false
+    
+    var body: some View {
+        VStack(spacing: 6) {
+            // Compact header - always visible (just toggles expand, no refresh)
+            Button(action: { 
+                withAnimation(.easeInOut(duration: 0.2)) { 
+                    isExpanded.toggle() 
+                } 
+            }) {
+                HStack(spacing: 6) {
+                    // Overall status indicator
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 10, height: 10)
+                    
+                    Text("System Health")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    if controller.healthStatus.isChecking {
+                        ProgressView()
+                            .scaleEffect(0.5)
+                            .frame(width: 12, height: 12)
+                    }
+                    
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            
+            // Expanded details
+            if isExpanded {
+                VStack(spacing: 4) {
+                    HealthCheckRow(
+                        label: "gphoto2",
+                        isOK: controller.healthStatus.gphoto2Installed,
+                        detail: controller.healthStatus.gphoto2Installed ? "Installed" : "Not found"
+                    )
+                    
+                    HealthCheckRow(
+                        label: "Daemons",
+                        isOK: controller.healthStatus.daemonsKilled,
+                        detail: controller.healthStatus.daemonsKilled ? "Cleared" : "Active ⚠️"
+                    )
+                    
+                    HealthCheckRow(
+                        label: "Camera",
+                        isOK: controller.healthStatus.cameraDetected,
+                        detail: controller.healthStatus.cameraDetected ? controller.healthStatus.cameraModel : "Not detected"
+                    )
+                    
+                    HealthCheckRow(
+                        label: "Storage",
+                        isOK: controller.healthStatus.captureFolderWritable,
+                        detail: controller.healthStatus.captureFolderWritable ? "Writable" : "Not writable"
+                    )
+                    
+                    // Refresh button
+                    Button(action: {
+                        controller.refreshHealthChecks()
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Refresh")
+                        }
+                        .font(.caption2)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(controller.healthStatus.isChecking)
+                    .padding(.top, 4)
+                    
+                    // Quick help if issues
+                    if !controller.healthStatus.allGood {
+                        VStack(alignment: .leading, spacing: 2) {
+                            if !controller.healthStatus.gphoto2Installed {
+                                Text("Run: brew install gphoto2")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            }
+                            if !controller.healthStatus.cameraDetected {
+                                Text("Check USB & disable camera WiFi")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 2)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(8)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+        .cornerRadius(6)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+        )
+    }
+    
+    private var statusColor: Color {
+        if controller.healthStatus.isChecking {
+            return .gray
+        }
+        return controller.healthStatus.allGood ? .green : .orange
+    }
+}
+
+struct HealthCheckRow: View {
+    let label: String
+    let isOK: Bool
+    let detail: String
+    
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: isOK ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .font(.caption2)
+                .foregroundColor(isOK ? .green : .orange)
+            
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .frame(width: 50, alignment: .leading)
+            
+            Spacer()
+            
+            Text(detail)
+                .font(.caption2)
+                .foregroundColor(isOK ? .secondary : .orange)
+                .lineLimit(1)
+        }
     }
 }
 

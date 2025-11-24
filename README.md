@@ -1,14 +1,20 @@
-# Canon 6D Mark II Camera Controller
+# HOTWIRE - Canon 6D Mark II Tethering App
 
-A native macOS Swift application for controlling the Canon 6D Mark II camera via USB connection.
+A native macOS Swift application for tethered shooting with the Canon 6D Mark II camera. Built as a "guitar pedal for cameras" - a live texture engine that sits between the lens and the file.
 
 ## Features
 
-- **Live View**: Real-time camera preview at ~5fps
-- **Remote Capture**: Trigger shutter remotely
-- **Camera Settings**: Control ISO, aperture, and shutter speed
+### Working ✅
+- **Remote Capture**: Trigger shutter remotely with instant image preview
+- **Camera Settings**: Control ISO, aperture, and shutter speed from the app
 - **Connection Management**: Automatic camera detection and status monitoring
-- **Native Performance**: Built with Swift and SwiftUI for optimal M2 performance
+- **Automatic Daemon Killer**: Kills PTPCamera/ptpcamerad on launch - no manual terminal commands needed
+- **System Health Panel**: Shows gphoto2 status, daemon status, camera detection, and storage health
+- **Image Gallery**: Filmstrip view of captured images with Finder reveal and delete
+- **Native Performance**: Built with Swift and SwiftUI for optimal Apple Silicon performance
+
+### In Progress 🚧
+- **Live View**: Camera responds but preview not yet displaying in app (gphoto2 capture-preview working)
 
 ## Prerequisites
 
@@ -51,15 +57,17 @@ gphoto2 --version
 3. Set camera to **Manual mode** (M) or semi-manual (P/Av/Tv)
 4. Connect USB cable to camera and Mac
 
-### 4. Kill PTPCamera Daemon
+### 4. Camera Daemons (Automatic)
 
-macOS automatically launches PTPCamera when it detects a camera, which blocks third-party access:
+HOTWIRE now **automatically kills PTPCamera and ptpcamerad** on launch. The app performs aggressive daemon killing during startup and runs a continuous background "Daemon Killer" to prevent macOS from stealing the USB connection.
+
+**No manual steps required!** Just launch the app and it handles everything.
+
+If you need to manually kill daemons (rare):
 
 ```bash
-killall PTPCamera
+killall PTPCamera ptpcamerad
 ```
-
-You'll need to run this command each time you connect the camera.
 
 ### 5. Test Camera Connection
 

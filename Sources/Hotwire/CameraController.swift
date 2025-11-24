@@ -9,6 +9,9 @@ class CameraController: ObservableObject {
     @Published var connectionStatus: String = "Disconnected"
     @Published var statusMessage: String = "Ready"
     @Published var daemonKillerActive: Bool = false
+    
+    // Health Status (Quick diagnostic indicators)
+    @Published var healthStatus: HealthStatus = HealthStatus()
 
     // Live View
     @Published var isLiveViewActive: Bool = false
@@ -54,21 +57,134 @@ class CameraController: ObservableObject {
 
     func initialize() {
         statusMessage = "Initializing HOTWIRE..."
+        healthStatus.isChecking = true
         
-        // Start the Daemon Killer first - this is critical
-        startDaemonKiller()
-        
-        // Start connection monitor
-        startConnectionMonitor()
-        
-        setupCaptureFolder()
-        checkGphoto2Installation()
-        
-        // Give daemon killer a moment to clear the USB
         Task {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await scanForCamera()
+            // PHASE 1 COMPLETE: Aggressive daemon kill on launch
+            // This ensures PTPCamera never blocks the connection
+            statusMessage = "🔪 Killing camera daemons..."
+            await aggressiveDaemonKill()
+            
+            // Start continuous daemon killer
+            startDaemonKiller()
+            
+            // Run health checks
+            statusMessage = "🔍 Running health checks..."
+            await runHealthChecks()
+            
+            // Start connection monitor
+            startConnectionMonitor()
+            
+            setupCaptureFolder()
+            
+            // Give daemon killer a moment to clear the USB
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            scanForCamera()
             loadExistingCaptures()
+            
+            healthStatus.isChecking = false
+            statusMessage = healthStatus.summary
+        }
+    }
+    
+    // MARK: - Health Check System
+    
+    /// Performs aggressive daemon killing on launch - kills multiple times to ensure clean state
+    private func aggressiveDaemonKill() async {
+        // Kill daemons 5 times in rapid succession to ensure they're dead
+        // This is more aggressive than the periodic daemon killer
+        for _ in 1...5 {
+            await killAllCameraDaemons()
+            // Small delay between kills to catch any respawns
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+        healthStatus.daemonsKilled = true
+    }
+    
+    /// Runs all health checks on startup
+    func runHealthChecks() async {
+        // Run all checks and gather results
+        let gphoto2Result = await checkGphoto2HealthAsync()
+        let cameraResult = await checkCameraHealthAsync()
+        let folderWritable = checkCaptureFolderHealthSync()
+        let daemonsCleared = await checkDaemonsKilledAsync()
+        
+        // Update all properties at once on main actor (we're already on main actor)
+        healthStatus.gphoto2Installed = gphoto2Result.installed
+        healthStatus.gphoto2Version = gphoto2Result.version
+        healthStatus.cameraDetected = cameraResult.detected
+        healthStatus.cameraModel = cameraResult.model
+        healthStatus.captureFolderWritable = folderWritable
+        healthStatus.daemonsKilled = daemonsCleared
+    }
+    
+    /// Check gphoto2 installation - returns result tuple
+    private func checkGphoto2HealthAsync() async -> (installed: Bool, version: String) {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: gphoto2Path) {
+            let result = await getCommandOutput(gphoto2Path, arguments: ["--version"])
+            let version = result.components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? "Unknown"
+            return (true, version)
+        } else {
+            return (false, "Not installed")
+        }
+    }
+    
+    /// Check camera health - returns result tuple
+    private func checkCameraHealthAsync() async -> (detected: Bool, model: String) {
+        let output = await getCommandOutput(gphoto2Path, arguments: ["--auto-detect"])
+        let detected = output.contains("Canon")
+        
+        if detected {
+            let lines = output.components(separatedBy: "\n")
+            for line in lines {
+                if line.contains("Canon") {
+                    let components = line.components(separatedBy: "  ").filter { !$0.isEmpty }
+                    if let model = components.first {
+                        return (true, model.trimmingCharacters(in: .whitespaces))
+                    }
+                }
+            }
+            return (true, "Canon Camera")
+        } else {
+            return (false, "None")
+        }
+    }
+    
+    /// Check capture folder - synchronous, safe to call from main actor
+    private func checkCaptureFolderHealthSync() -> Bool {
+        let testFile = captureFolder.appendingPathComponent(".hotwire_write_test")
+        do {
+            try FileManager.default.createDirectory(at: captureFolder, withIntermediateDirectories: true)
+            try "test".write(to: testFile, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: testFile)
+            return true
+        } catch {
+            return false
+        }
+    }
+    
+    /// Check if daemons are killed - returns bool
+    private func checkDaemonsKilledAsync() async -> Bool {
+        let psOutput = await getCommandOutput("/bin/ps", arguments: ["aux"])
+        let daemonsRunning = psOutput.contains("PTPCamera") || psOutput.contains("ptpcamerad")
+        
+        if daemonsRunning {
+            // Kill them again
+            await aggressiveDaemonKill()
+            return false // Will be true on next check
+        }
+        return true
+    }
+    
+    /// Refresh health checks (can be called from UI)
+    func refreshHealthChecks() {
+        Task {
+            healthStatus.isChecking = true
+            statusMessage = "🔍 Refreshing health checks..."
+            await runHealthChecks()
+            healthStatus.isChecking = false
+            statusMessage = healthStatus.summary
         }
     }
     
@@ -101,6 +217,12 @@ class CameraController: ObservableObject {
         
         let wasConnected = isConnected
         
+        // Update both connection status AND health status
+        healthStatus.cameraDetected = nowConnected
+        if !nowConnected {
+            healthStatus.cameraModel = "None"
+        }
+        
         if wasConnected && !nowConnected {
             // Camera was disconnected
             isConnected = false
@@ -124,25 +246,43 @@ class CameraController: ObservableObject {
         isCheckingConnection = false
     }
     
-    /// Get command output as string
-    private func getCommandOutput(_ command: String, arguments: [String]) async -> String {
+    /// Get command output as string - runs on background queue with timeout
+    private func getCommandOutput(_ command: String, arguments: [String], timeout: TimeInterval = 5.0) async -> String {
         return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: command)
-            process.arguments = arguments
-            
-            let outputPipe = Pipe()
-            process.standardOutput = outputPipe
-            process.standardError = FileHandle.nullDevice
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: output)
-            } catch {
-                continuation.resume(returning: "")
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: command)
+                process.arguments = arguments
+                
+                let outputPipe = Pipe()
+                process.standardOutput = outputPipe
+                process.standardError = FileHandle.nullDevice
+                
+                var didResume = false
+                let resumeOnce: (String) -> Void = { result in
+                    if !didResume {
+                        didResume = true
+                        continuation.resume(returning: result)
+                    }
+                }
+                
+                // Timeout handler
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if !didResume {
+                        process.terminate()
+                        resumeOnce("")
+                    }
+                }
+                
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(data: data, encoding: .utf8) ?? ""
+                    resumeOnce(output)
+                } catch {
+                    resumeOnce("")
+                }
             }
         }
     }
@@ -179,7 +319,6 @@ class CameraController: ObservableObject {
         // These are the culprits that steal USB camera connections on macOS:
         // 1. ptpcamerad - The main PTP camera daemon (most aggressive)
         // 2. PTPCamera - Legacy daemon
-        // 3. photolibraryd - Can sometimes grab the device
         
         let daemons = ["ptpcamerad", "PTPCamera"]
         
@@ -188,21 +327,38 @@ class CameraController: ObservableObject {
         }
     }
     
-    /// Run a command without updating status (for background daemon killing)
-    private func runCommandQuiet(_ command: String, arguments: [String]) async -> Bool {
+    /// Run a command without updating status (for background daemon killing) - with timeout
+    private func runCommandQuiet(_ command: String, arguments: [String], timeout: TimeInterval = 3.0) async -> Bool {
         return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: command)
-            process.arguments = arguments
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                continuation.resume(returning: process.terminationStatus == 0)
-            } catch {
-                continuation.resume(returning: false)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: command)
+                process.arguments = arguments
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                
+                var didResume = false
+                let resumeOnce: (Bool) -> Void = { result in
+                    if !didResume {
+                        didResume = true
+                        continuation.resume(returning: result)
+                    }
+                }
+                
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if !didResume {
+                        process.terminate()
+                        resumeOnce(false)
+                    }
+                }
+                
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    resumeOnce(process.terminationStatus == 0)
+                } catch {
+                    resumeOnce(false)
+                }
             }
         }
     }
@@ -293,15 +449,6 @@ class CameraController: ObservableObject {
     }
 
     // MARK: - Camera Detection
-
-    private func checkGphoto2Installation() {
-        let fileManager = FileManager.default
-        if !fileManager.fileExists(atPath: gphoto2Path) {
-            statusMessage = "⚠️ gphoto2 not installed. Run: brew install gphoto2"
-            return
-        }
-        statusMessage = "gphoto2 found"
-    }
 
     func scanForCamera() {
         statusMessage = "Scanning for camera..."
@@ -452,35 +599,51 @@ class CameraController: ObservableObject {
         isFetchingFrame = false
     }
     
-    /// Run a shell command (for atomic kill-and-execute operations)
-    private func runShellCommand(_ command: String) async -> (success: Bool, output: String, error: String) {
+    /// Run a shell command (for atomic kill-and-execute operations) - with timeout
+    private func runShellCommand(_ command: String, timeout: TimeInterval = 10.0) async -> (success: Bool, output: String, error: String) {
         return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-c", command]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                process.arguments = ["-c", command]
 
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
+                let outputPipe = Pipe()
+                let errorPipe = Pipe()
 
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
+                process.standardOutput = outputPipe
+                process.standardError = errorPipe
+                
+                var didResume = false
+                let resumeOnce: ((Bool, String, String)) -> Void = { result in
+                    if !didResume {
+                        didResume = true
+                        continuation.resume(returning: result)
+                    }
+                }
+                
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if !didResume {
+                        process.terminate()
+                        resumeOnce((false, "", "Timeout"))
+                    }
+                }
 
-            do {
-                try process.run()
-                process.waitUntilExit()
+                do {
+                    try process.run()
+                    process.waitUntilExit()
 
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
 
-                let output = String(data: outputData, encoding: .utf8) ?? ""
-                let error = String(data: errorData, encoding: .utf8) ?? ""
+                    let output = String(data: outputData, encoding: .utf8) ?? ""
+                    let error = String(data: errorData, encoding: .utf8) ?? ""
 
-                // Check for successful capture (file saved message or no error)
-                let success = process.terminationStatus == 0 || output.contains("Saving file")
+                    let success = process.terminationStatus == 0 || output.contains("Saving file")
 
-                continuation.resume(returning: (success, output, error))
-            } catch {
-                continuation.resume(returning: (false, "", error.localizedDescription))
+                    resumeOnce((success, output, error))
+                } catch {
+                    resumeOnce((false, "", error.localizedDescription))
+                }
             }
         }
     }
@@ -609,33 +772,50 @@ class CameraController: ObservableObject {
 
     // MARK: - Command Execution
 
-    private func runCommand(_ command: String, arguments: [String]) async -> (success: Bool, output: String, error: String) {
+    private func runCommand(_ command: String, arguments: [String], timeout: TimeInterval = 10.0) async -> (success: Bool, output: String, error: String) {
         return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: command)
-            process.arguments = arguments
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: command)
+                process.arguments = arguments
 
-            let outputPipe = Pipe()
-            let errorPipe = Pipe()
+                let outputPipe = Pipe()
+                let errorPipe = Pipe()
 
-            process.standardOutput = outputPipe
-            process.standardError = errorPipe
+                process.standardOutput = outputPipe
+                process.standardError = errorPipe
+                
+                var didResume = false
+                let resumeOnce: ((Bool, String, String)) -> Void = { result in
+                    if !didResume {
+                        didResume = true
+                        continuation.resume(returning: result)
+                    }
+                }
+                
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if !didResume {
+                        process.terminate()
+                        resumeOnce((false, "", "Timeout"))
+                    }
+                }
 
-            do {
-                try process.run()
-                process.waitUntilExit()
+                do {
+                    try process.run()
+                    process.waitUntilExit()
 
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
 
-                let output = String(data: outputData, encoding: .utf8) ?? ""
-                let error = String(data: errorData, encoding: .utf8) ?? ""
+                    let output = String(data: outputData, encoding: .utf8) ?? ""
+                    let error = String(data: errorData, encoding: .utf8) ?? ""
 
-                let success = process.terminationStatus == 0
+                    let success = process.terminationStatus == 0
 
-                continuation.resume(returning: (success, output, error))
-            } catch {
-                continuation.resume(returning: (false, "", error.localizedDescription))
+                    resumeOnce((success, output, error))
+                } catch {
+                    resumeOnce((false, "", error.localizedDescription))
+                }
             }
         }
     }
@@ -650,4 +830,34 @@ struct CapturedImage: Identifiable {
     let fullImage: NSImage
     let filename: String
     let captureDate: Date
+}
+
+// MARK: - Health Status Model
+
+struct HealthStatus {
+    var gphoto2Installed: Bool = false
+    var gphoto2Version: String = "Unknown"
+    var cameraDetected: Bool = false
+    var cameraModel: String = "None"
+    var captureFolderWritable: Bool = false
+    var daemonsKilled: Bool = false
+    var isChecking: Bool = false
+    
+    var allGood: Bool {
+        gphoto2Installed && cameraDetected && captureFolderWritable && daemonsKilled
+    }
+    
+    var summary: String {
+        var issues: [String] = []
+        if !gphoto2Installed { issues.append("gphoto2 not found") }
+        if !daemonsKilled { issues.append("Camera daemons active") }
+        if !cameraDetected { issues.append("Camera not detected") }
+        if !captureFolderWritable { issues.append("Capture folder not writable") }
+        
+        if issues.isEmpty {
+            return "✓ All systems ready"
+        } else {
+            return "⚠️ " + issues.joined(separator: ", ")
+        }
+    }
 }
