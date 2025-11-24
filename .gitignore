@@ -1,0 +1,30 @@
+# Xcode
+.DS_Store
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.moved-aside
+DerivedData/
+*.hmap
+*.ipa
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+*.swiftpm
+
+# Captured images
+IMG_*.jpg
+IMG_*.cr2
+IMG_*.raw
+*.dng
+
+# Temporary files
+/tmp/
+*.tmp
+canon_preview_*.jpg
+
+# macOS
+.Spotlight-V100
+.Trashes

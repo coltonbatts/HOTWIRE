@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:test}",
+            "name": "Debug CanonCameraController",
+            "target": "CanonCameraController",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CanonCameraController"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:test}",
+            "name": "Release CanonCameraController",
+            "target": "CanonCameraController",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CanonCameraController"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:test}",
+            "name": "Debug Hotwire",
+            "target": "Hotwire",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Hotwire"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:test}",
+            "name": "Release Hotwire",
+            "target": "Hotwire",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Hotwire"
+        }
+    ]
+}
