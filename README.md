@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="HOTWIRE.jpg" alt="HOTWIRE" width="600">
+</p>
+
 # HOTWIRE - Canon 6D Mark II Tethering App
 
 A native macOS Swift application for tethered shooting with the Canon 6D Mark II camera. Built as a "guitar pedal for cameras" - a live texture engine that sits between the lens and the file.
